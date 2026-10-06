@@ -2,8 +2,9 @@
 # bin/compile <build-dir> <cache-dir> <env-dir>
 #
 # Third South fork of jakeg/heroku-buildpack-bun. Differences from upstream:
-# - The bun binary and bun's package cache live in CACHE_DIR, so repeat builds
-#   skip the bun download and install packages from local cache.
+# - The bun binary is cached in CACHE_DIR per pinned version. The package cache
+#   is NOT: a cold `bun install` takes seconds, while Heroku restores and saves
+#   CACHE_DIR on every build, so a ~220 MB package cache cost more than it saved.
 # - Nothing bun-related is written into the slug (no .heroku/bin, no install
 #   cache, no .profile.d). Bun is a build-time tool here.
 # - Script failures fail the build (upstream runs them under `set +e`).
@@ -50,7 +51,9 @@ else
   curl -fsSL --retry-connrefused --retry 3 https://bun.sh/install | bash "${BUN_INSTALL_ARGS[@]}"
 fi
 export PATH="$BUN_INSTALL/bin:$PATH"
-export BUN_INSTALL_CACHE_DIR="$CACHE_DIR/bun-install-cache"
+export BUN_INSTALL_CACHE_DIR="$(mktemp -d)"
+# Purge the package cache earlier versions of this fork stored in CACHE_DIR.
+rm -rf "$CACHE_DIR/bun-install-cache"
 echo "Bun $(bun --version)"
 
 # Let subsequent buildpacks call bun during the build.
