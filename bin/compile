@@ -1,9 +1,13 @@
 #!/usr/bin/env bash
 # bin/compile <build-dir> <cache-dir> <env-dir>
-# $HOME: /app
+#
+# Third South fork of jakeg/heroku-buildpack-bun. Differences from upstream:
+# - The bun binary and bun's package cache live in CACHE_DIR, so repeat builds
+#   skip the bun download and install packages from local cache.
+# - Nothing bun-related is written into the slug (no .heroku/bin, no install
+#   cache, no .profile.d). Bun is a build-time tool here.
+# - Script failures fail the build (upstream runs them under `set +e`).
 
-# -e - always exit on error
-# -o pipefail - don't ignore exit codes when piping output
 set -eo pipefail
 
 BUILD_DIR=${1:-.}
@@ -11,93 +15,62 @@ CACHE_DIR=${2:-}
 ENV_DIR=${3:-}
 BP_DIR=$(cd "$(dirname "${0:-}")"; cd ..; pwd)
 
-### Load dependencies
 source "$BP_DIR/lib/json.sh"
 
-HEROKU_DIR=$BUILD_DIR/.heroku
-BIN_DIR=$HEROKU_DIR/bin
-
-# To enable the local source build cache path, copy the files and match the build path with the startup path.
-cp -rp $BUILD_DIR $HOME
-cd $HOME
-
-# Export the content of the ENV_DIR into the environment
 if [ -d "$ENV_DIR" ]; then
-  for e in $(ls $ENV_DIR); do
-    export "$e=$(cat $ENV_DIR/$e)"
+  for e in $(ls "$ENV_DIR"); do
+    export "$e=$(cat "$ENV_DIR/$e")"
   done
 fi
 
 # Allow Bun version pinning via a choice of 3 different files
-if [ -f $BUILD_DIR/.bun-version ]
-then
-  BUN_VERSION="$(cat $BUILD_DIR/.bun-version)"
-elif [ -f $BUILD_DIR/runtime.bun.txt ]
-then
-  BUN_VERSION="$(cat $BUILD_DIR/runtime.bun.txt)"
-elif [ -f $BUILD_DIR/runtime.txt ]
-then
-  BUN_VERSION="$(cat $BUILD_DIR/runtime.txt)"
+if [ -f "$BUILD_DIR/.bun-version" ]; then
+  BUN_VERSION="$(cat "$BUILD_DIR/.bun-version")"
+elif [ -f "$BUILD_DIR/runtime.bun.txt" ]; then
+  BUN_VERSION="$(cat "$BUILD_DIR/runtime.bun.txt")"
+elif [ -f "$BUILD_DIR/runtime.txt" ]; then
+  BUN_VERSION="$(cat "$BUILD_DIR/runtime.txt")"
 fi
-echo "Installing Bun $BUN_VERSION"
+BUN_VERSION="$(echo "$BUN_VERSION" | tr -d '[:space:]')"
+if [[ $BUN_VERSION =~ ^[0-9] ]]; then
+  BUN_VERSION="v${BUN_VERSION}"
+fi
 
-if [[ -n $BUN_VERSION ]]
-then
-  # prepend a v to version numbers, eg 1.0.19 -> v1.0.19
-  if [[ $BUN_VERSION =~ ^[0-9] ]]; then
-    BUN_VERSION="v${BUN_VERSION}"
+# Only a pinned version is cacheable; "latest" changes under us.
+export BUN_INSTALL="$CACHE_DIR/bun/${BUN_VERSION:-latest}"
+if [[ -n $BUN_VERSION && -x "$BUN_INSTALL/bin/bun" ]]; then
+  echo "Using cached Bun $BUN_VERSION"
+else
+  echo "Installing Bun ${BUN_VERSION:-latest}"
+  rm -rf "$CACHE_DIR/bun"
+  BUN_INSTALL_ARGS=()
+  if [[ -n $BUN_VERSION ]]; then
+    BUN_INSTALL_ARGS=(-s "bun-$BUN_VERSION")
   fi
-  BUN_INSTALL_VERSION="-s bun-$BUN_VERSION"
+  curl -fsSL --retry-connrefused --retry 3 https://bun.sh/install | bash "${BUN_INSTALL_ARGS[@]}"
 fi
-
-# install bun
-export BUN_INSTALL=$BUILD_DIR/.heroku
-export BUN_DIR=$BUILD_DIR/.heroku/cache
-curl -fsSL --retry-connrefused --retry 3 https://bun.sh/install | bash $BUN_INSTALL_VERSION
 export PATH="$BUN_INSTALL/bin:$PATH"
+export BUN_INSTALL_CACHE_DIR="$CACHE_DIR/bun-install-cache"
+echo "Bun $(bun --version)"
 
-# set environment variables at runtime
-PROFILE_PATH="$BUILD_DIR/.profile.d/bun.sh"
-mkdir -p $(dirname $PROFILE_PATH)
-echo 'export PATH="$HOME/.heroku/bin:$PATH"' >> $PROFILE_PATH
-echo 'export BUN_DIR="$HOME/.heroku/cache"' >> $PROFILE_PATH
+# Let subsequent buildpacks call bun during the build.
+echo "export PATH=\"$BUN_INSTALL/bin:\$PATH\"" >> "$BP_DIR/export"
+echo "export BUN_INSTALL_CACHE_DIR=\"$BUN_INSTALL_CACHE_DIR\"" >> "$BP_DIR/export"
 
-# export environment variables to subsequent buildpacks
-echo "export PATH=\"$BUILD_DIR/.heroku/bin:\$PATH\"" >> "$BP_DIR/export"
-echo "export BUN_DIR=\"$BUILD_DIR/.heroku/cache\"" >> "$BP_DIR/export"
+cd "$BUILD_DIR"
 
-echo "Installed Bun v$(bun --version)"
-
-set +e
-
-cd $BUILD_DIR
-
-# download dependencies
-if [[ -f package.json && ! -f .skip-bun-install ]]
-then
+if [[ -f package.json && ! -f .skip-bun-install ]]; then
   echo "Installing dependencies..."
-  bun install
+  if [[ -f bun.lock || -f bun.lockb ]]; then
+    bun install --frozen-lockfile
+  else
+    bun install
+  fi
 fi
 
-has_heroku_prebuild_script=$(has_script "package.json" "heroku-prebuild")
-if [[ "$has_heroku_prebuild_script" == "true" && ! -f .skip-bun-heroku-prebuild ]]
-then
-  echo "Running Heroku prebuild script..."
-  bun run heroku-prebuild
-fi
-
-has_build_script=$(has_script "package.json" "build")
-if [[ "$has_build_script" == "true" && ! -f .skip-bun-build ]]
-then
-  echo "Building application..."
-  bun run build
-  echo "Done building application..."
-fi
-
-has_heroku_postbuild_script=$(has_script "package.json" "heroku-postbuild")
-if [[ "$has_heroku_postbuild_script" == "true" && ! -f .skip-bun-heroku-postbuild ]]
-then
-  echo "Running Heroku postbuild script..."
-  bun run heroku-postbuild
-fi
-
+for script in heroku-prebuild build heroku-postbuild; do
+  if [[ -f package.json && "$(has_script "package.json" "$script")" == "true" && ! -f ".skip-bun-$script" ]]; then
+    echo "Running $script..."
+    bun run "$script"
+  fi
+done
